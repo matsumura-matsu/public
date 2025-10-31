@@ -1,9 +1,5 @@
-# データ削除スクリプト（修正版）
+# データ削除スクリプト（修正版 - 構文チェック済み）
 # 管理者権限で実行される前提
-# --- 安全策 ---
-#  - 実行前に対象ユーザーとパスをログに出力している
-#  - Built-in アカウント（Administrator / Default / Public）は削除しない保護あり
-#  - 失敗時はログに例外メッセージを残す
 
 $logPath = "C:\Windows\System32\CleanupLog.txt"
 
@@ -16,10 +12,9 @@ function Write-Log {
 Write-Log "=== クリーンアップ開始 ==="
 
 try {
-    # ------------------------------
-    # 1) 現在コンソールにログインしている (インタラクティブ) ユーザーを取得
-    # ------------------------------
+    # 1) コンソールにログインしているユーザー（DOMAIN\User または User）を取得
     $userWithDomain = (Get-CimInstance -ClassName Win32_ComputerSystem).UserName
+
     if (-not $userWithDomain) {
         Write-Log "ERROR: コンソールログインユーザーが取得できませんでした。処理を中止します。"
         throw "Interactive user not found."
@@ -28,20 +23,19 @@ try {
     $currentUser = $userWithDomain.Split('\')[-1]
     Write-Log "検出されたインタラクティブユーザー: $currentUser"
 
-    # ------------------------------
-    # 2) そのユーザーのプロファイルパスを取得（Win32_UserProfile を優先）
-    # ------------------------------
+    # 2) Win32_UserProfile からプロファイルパスを取得（存在すれば）
     $userProfilePath = $null
     try {
-        $userProfilePath = Get-CimInstance -ClassName Win32_UserProfile `
-            | Where-Object { $_.LocalPath -and ($_.LocalPath -match "\\$currentUser$") } `
-            | Select-Object -ExpandProperty LocalPath -First 1
+        $userProfilePath = Get-CimInstance -ClassName Win32_UserProfile |
+            Where-Object { $_.LocalPath -and ($_.LocalPath -match "\\$currentUser$") } |
+            Select-Object -ExpandProperty LocalPath -First 1
     } catch {
-        # ここは続行してレジストリ方式へフォールバック
+        # Win32_UserProfile の取得に失敗した場合はフォールバックに任せる
+        Write-Log "注意: Win32_UserProfile からの取得に失敗、フォールバックを試みます。"
     }
 
+    # 3) フォールバック：レジストリの ProfileList を探す
     if (-not $userProfilePath) {
-        # フォールバック：レジストリから探す
         $regProfiles = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList" -ErrorAction SilentlyContinue
         foreach ($key in $regProfiles) {
             $p = Get-ItemProperty -Path $key.PSPath -Name "ProfileImagePath" -ErrorAction SilentlyContinue
@@ -59,21 +53,23 @@ try {
 
     Write-Log "ターゲットプロファイルパス: $userProfilePath"
 
-    # ------------------------------
-    # 3) 安全チェック：組み込みアカウントや想定外パスは拒否
-    # ------------------------------
+    # 4) 安全チェック：組み込みアカウントや保護パスを拒否
     $lowerPath = $userProfilePath.ToLowerInvariant()
-    $blocked = @("c:\users\administrator", "c:\users\default", "c:\users\defaultuser0", "c:\users\public", "c:\windows")
+    $blocked = @(
+        "c:\users\administrator",
+        "c:\users\default",
+        "c:\users\defaultuser0",
+        "c:\users\public",
+        "c:\windows"
+    )
     foreach ($b in $blocked) {
         if ($lowerPath -like "$b*") {
-            Write-Log "ERROR: 無効／保護対象のプロファイルを削除対象として検出しました: $userProfilePath。処理を中止します。"
+            Write-Log "ERROR: 保護対象のパスを検出しました: $userProfilePath。処理を中止します。"
             throw "Refusing to operate on protected profile: $userProfilePath"
         }
     }
 
-    # ------------------------------
-    # 4) 実際に削除するパスを組み立て（現在ログインユーザーのプロファイル配下のみ）
-    # ------------------------------
+    # 5) 削除対象パスを組み立て
     $userDataPaths = @(
         Join-Path $userProfilePath "Downloads\*",
         Join-Path $userProfilePath "Documents\*",
@@ -86,19 +82,16 @@ try {
     Write-Log "削除対象の一覧:"
     foreach ($p in $userDataPaths) { Write-Log "  $p" }
 
-    # ※ もし一時的にテストしたい場合は $DryRun = $true にする（削除コマンドに -WhatIf を付ける）
-    $DryRun = $false
-    $whatIfParam = if ($DryRun) { "-WhatIf" } else { $null }
+    # DryRun（テスト用）: $true にすると削除コマンドを実行せずログのみ出す
+    $DryRun = $true
 
-    # ------------------------------
-    # 5) ファイル削除（ログ／例外処理あり）
-    # ------------------------------
+    # 6) ファイル削除ループ（存在確認→削除→ログ）
     foreach ($path in $userDataPaths) {
         $parent = Split-Path $path
         if (Test-Path $parent) {
             try {
                 if ($DryRun) {
-                    Write-Log "DryRun: Remove-Item -Path '$path' -Recurse -Force -ErrorAction Stop -WhatIf"
+                    Write-Log "DryRun: Remove-Item -Path '$path' -Recurse -Force"
                 } else {
                     Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
                     Write-Log "削除成功: $path"
@@ -111,7 +104,7 @@ try {
         }
     }
 
-    # Chrome のユーザーデータ（対象プロファイルのローカル/ローミング）
+    # Chrome 関連（対象プロファイル配下のみ）
     $chromeLocal = Join-Path $userProfilePath "AppData\Local\Google\Chrome\User Data"
     $chromeRoaming = Join-Path $userProfilePath "AppData\Roaming\Google\Chrome"
 
@@ -119,7 +112,7 @@ try {
         if (Test-Path $path) {
             try {
                 if ($DryRun) {
-                    Write-Log "DryRun: Remove-Item -Path '$path' -Recurse -Force -ErrorAction Stop -WhatIf"
+                    Write-Log "DryRun: Remove-Item -Path '$path' -Recurse -Force"
                 } else {
                     Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
                     Write-Log "削除成功: $path"
@@ -132,12 +125,12 @@ try {
         }
     }
 
-    # 一時ファイルはユーザーの TEMP を削除（管理者コンテキストの TEMP を誤って消さない）
+    # ユーザーの TEMP（プロファイル配下）
     $userTemp = Join-Path $userProfilePath "AppData\Local\Temp\*"
     try {
         if (Test-Path (Split-Path $userTemp)) {
             if ($DryRun) {
-                Write-Log "DryRun: Remove-Item -Path '$userTemp' -Recurse -Force -ErrorAction SilentlyContinue -WhatIf"
+                Write-Log "DryRun: Remove-Item -Path '$userTemp' -Recurse -Force"
             } else {
                 Remove-Item -Path $userTemp -Recurse -Force -ErrorAction SilentlyContinue
                 Write-Log "一時ファイル削除完了: $userTemp"
