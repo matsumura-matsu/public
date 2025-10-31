@@ -1,224 +1,82 @@
-#Requires -RunAsAdministrator
-# データ削除スクリプト（安全化・堅牢化版）
-# 変更点:
-# - 管理者必須の宣言（#Requires）
-# - DryRun をパラメータ化（-DryRun:$true|$false）し Remove-Item の -WhatIf に連動
-# - インタラクティブユーザーの SID を解決し、SID で Win32_UserProfile/レジストリから確実にプロファイルパス取得
-# - 管理者/システム系ユーザーや Windows 配下などの保護対象を多層チェックで拒否
-# - Chrome 稼働中プロセスの停止（実削除時のみ）
-# - 既定ログ出力先を ProgramData 配下にし、作成不可時は System32 にフォールバック
+# データ削除スクリプト
+# 管理者権限で実行される前提
 
-param(
-    [switch]$DryRun = $true,
-    [string]$LogPathOverride
-)
-
-# ログパスの決定（ProgramData 配下 -> フォールバック）
-$logPath = if ($LogPathOverride) {
-    $LogPathOverride
-} else {
-    Join-Path $env:ProgramData 'Cleanup\CleanupLog.txt'
-}
-try {
-    $logDir = Split-Path -Parent $logPath
-    if ($logDir -and -not (Test-Path $logDir)) {
-        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
-    }
-} catch {
-    # ProgramData に作れない場合は System32 を利用
-    $logPath = "C:\\Windows\\System32\\CleanupLog.txt"
-}
+# ログファイルのパス
+$logPath = "C:\Windows\System32\CleanupLog.txt"
 
 function Write-Log {
-    param([string]$Message)
+    param($Message)
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    try {
-        "$timestamp - $Message" | Out-File -FilePath $logPath -Append -Encoding UTF8
-    } catch {
-        # ログ出力で例外になっても主処理は継続
-        Write-Host "$timestamp - $Message"
-    }
+    "$timestamp - $Message" | Out-File -FilePath $logPath -Append
 }
 
-Write-Log "=== クリーンアップ開始 (DryRun=$($DryRun.IsPresent)) ==="
+Write-Log "=== クリーンアップ開始 ==="
 
 try {
-    # =========================
-    # 1) インタラクティブユーザー取得
-    # =========================
-    $userWithDomain = $null
-    try {
-        $userWithDomain = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).UserName
-    } catch {
-        Write-Log "ERROR: Win32_ComputerSystem からのユーザー取得に失敗: $($_.Exception.Message)"
-        throw "Cannot get interactive user."
-    }
+    # 現在のユーザー名を取得
+    $currentUser = $env:USERNAME
+    $userProfile = $env:USERPROFILE
 
-    if (-not $userWithDomain) {
-        Write-Log "ERROR: コンソールログインユーザーが取得できませんでした。処理を中止します。"
-        throw "Interactive user not found."
-    }
+    Write-Log "対象ユーザー: $currentUser"
 
-    $currentUser = $userWithDomain.Split('\\')[-1]
-    Write-Log "検出されたインタラクティブユーザー: $currentUser"
+    # Chromeプロセスを強制終了
+    Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Seconds 2
 
-    # 危険ユーザー名の直接遮断（ドライブレター差異に依存しない）
-    $blockedUsers = @('administrator','default','defaultuser0','public','system')
-    if ($blockedUsers -contains $currentUser.ToLowerInvariant()) {
-        Write-Log "ERROR: 保護対象ユーザー名を検出しました: $currentUser。処理を中止します。"
-        throw "Refusing to operate on protected user: $currentUser"
-    }
-
-    # =========================
-    # 2) プロファイルパス検索（SID -> Win32_UserProfile -> レジストリ）
-    # =========================
-    $userProfilePath = $null
-
-    # まず SID を解決
-    $sid = $null
-    try {
-        $sid = (New-Object System.Security.Principal.NTAccount($userWithDomain)).Translate([System.Security.Principal.SecurityIdentifier]).Value
-        Write-Log "解決された SID: $sid"
-    } catch {
-        Write-Log "ERROR: SID 解決に失敗: $($_.Exception.Message)"
-        throw "Cannot resolve SID for $userWithDomain"
-    }
-
-    # SID で Win32_UserProfile を検索
-    try {
-        $profileBySid = Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$sid'" -ErrorAction Stop | Select-Object -First 1
-        if ($profileBySid -and $profileBySid.LocalPath) {
-            $userProfilePath = $profileBySid.LocalPath
-        }
-    } catch {
-        Write-Log "注意: Win32_UserProfile 取得に失敗: $($_.Exception.Message)"
-        $userProfilePath = $null
-    }
-
-    # レジストリにフォールバック（SID 直指定）
-    if (-not $userProfilePath) {
-        try {
-            $regKeyPath = "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\$sid"
-            $p = Get-ItemProperty -Path $regKeyPath -Name "ProfileImagePath" -ErrorAction Stop
-            if ($p.ProfileImagePath) {
-                $userProfilePath = $p.ProfileImagePath
-            }
-        } catch {
-            Write-Log "ERROR: レジストリからプロファイルパスを取得できません: $($_.Exception.Message)"
-            throw "Cannot read profile path from registry for SID $sid"
-        }
-    }
-
-    if (-not $userProfilePath) {
-        Write-Log "ERROR: ユーザープロファイルのパスが特定できませんでした。処理を中止します。"
-        throw "User profile path not found."
-    }
-
-    Write-Log "ターゲットプロファイルパス: $userProfilePath"
-
-    # =========================
-    # 3) 安全チェック
-    # =========================
-    $lowerPath = $userProfilePath.ToLowerInvariant()
-    $blockedPaths = @(
-        "\\windows",            # Windows 配下
-        "\\users\\administrator",# 管理者プロファイル
-        "\\users\\default",      # Default
-        "\\users\\defaultuser0", # DefaultUser0
-        "\\users\\public"        # Public
-    )
-    foreach ($b in $blockedPaths) {
-        if ($lowerPath -like "*${b}*") {
-            Write-Log "ERROR: 保護対象のパスを検出しました: $userProfilePath。処理を中止します。"
-            throw "Refusing to operate on protected profile: $userProfilePath"
-        }
-    }
-    # 一般的なユーザープロファイル配下であることを確認（Users 直下）
-    if ($lowerPath -notlike "*\\users\\*") {
-        Write-Log "ERROR: ユーザープロファイルの一般的な配置ではありません: $userProfilePath"
-        throw "Unexpected profile path location: $userProfilePath"
-    }
-
-    # =========================
-    # 4) 削除対象パス組み立て
-    # =========================
-    $userDataPaths = @(
-        Join-Path $userProfilePath "Downloads\*",
-        Join-Path $userProfilePath "Documents\*",
-        Join-Path $userProfilePath "Desktop\*",
-        Join-Path $userProfilePath "Pictures\*",
-        Join-Path $userProfilePath "Videos\*",
-        Join-Path $userProfilePath "Music\*"
+    # Chromeのユーザーデータを削除
+    $chromePaths = @(
+        "$env:LOCALAPPDATA\Google\Chrome\User Data",
+        "$env:APPDATA\Google\Chrome"
     )
 
-    Write-Log "削除対象の一覧:"
-    foreach ($p in $userDataPaths) { Write-Log "  $p" }
-
-    # =========================
-    # 5) 削除ループ（各 path ごとに try/catch）
-    # =========================
-    foreach ($path in $userDataPaths) {
-        $parent = Split-Path $path
-        if (Test-Path $parent) {
-            try {
-                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop -WhatIf:$DryRun
-                if ($DryRun) { Write-Log "DryRun: $path を削除予定" } else { Write-Log "削除成功: $path" }
-            } catch {
-                Write-Log "削除失敗: $path - $($_.Exception.Message)"
-            }
-        } else {
-            Write-Log "存在しないためスキップ: $parent"
-        }
-    }
-
-    # =========================
-    # 6) Chrome データ（プロファイル配下）
-    # =========================
-    $chromeLocal = Join-Path $userProfilePath "AppData\Local\Google\Chrome\User Data"
-    $chromeRoaming = Join-Path $userProfilePath "AppData\Roaming\Google\Chrome"
-
-    # 実削除時は Chrome を停止
-    if (-not $DryRun) {
-        try {
-            Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Write-Log "Chrome プロセスを停止しました"
-        } catch {
-            Write-Log "Chrome 停止失敗: $($_.Exception.Message)"
-        }
-    }
-
-    foreach ($path in @($chromeLocal, $chromeRoaming)) {
+    foreach ($path in $chromePaths) {
         if (Test-Path $path) {
             try {
-                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop -WhatIf:$DryRun
-                if ($DryRun) { Write-Log "DryRun: $path を削除予定" } else { Write-Log "削除成功: $path" }
+                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
+                Write-Log "削除成功: $path"
             } catch {
                 Write-Log "削除失敗: $path - $($_.Exception.Message)"
             }
-        } else {
-            Write-Log "Chrome データが見つかりませんでした: $path"
         }
     }
 
-    # =========================
-    # 7) ユーザー TEMP（プロファイル配下）
-    # =========================
-    $userTemp = Join-Path $userProfilePath "AppData\Local\Temp\*"
-    try {
-        if (Test-Path (Split-Path $userTemp)) {
-            Remove-Item -Path $userTemp -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$DryRun
-            if ($DryRun) { Write-Log "DryRun: $userTemp を削除予定" } else { Write-Log "一時ファイル削除完了: $userTemp" }
-        } else {
-            Write-Log "ユーザー TEMP が見つかりません: $userTemp"
+    # ユーザー領域のデータを削除
+    $userDataPaths = @(
+        "$userProfile\Downloads\*",
+        "$userProfile\Documents\*",
+        "$userProfile\Desktop\*",
+        "$userProfile\Pictures\*",
+        "$userProfile\Videos\*",
+        "$userProfile\Music\*"
+    )
+
+    foreach ($path in $userDataPaths) {
+        if (Test-Path (Split-Path $path)) {
+            try {
+                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
+                Write-Log "削除成功: $path"
+            } catch {
+                Write-Log "削除失敗: $path - $($_.Exception.Message)"
+            }
         }
-    } catch {
-        Write-Log "一時ファイル削除中のエラー: $($_.Exception.Message)"
+    }
+
+    # 一時ファイルの削除
+    $tempPaths = @(
+        "$env:TEMP\*",
+        "$env:LOCALAPPDATA\Temp\*"
+    )
+
+    foreach ($path in $tempPaths) {
+        try {
+            Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
+        } catch {
+            # 一時ファイルはエラーがあっても続行
+        }
     }
 
     Write-Log "=== クリーンアップ完了 ==="
 
 } catch {
-    # トップレベルの例外はここに来る
     Write-Log "エラー発生: $($_.Exception.Message)"
 }
-
