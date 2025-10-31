@@ -1,14 +1,46 @@
-# データ削除スクリプト（構文エラー修正済み・try/catch 完全対応）
-# 管理者権限で実行される前提
-$logPath = "C:\Windows\System32\CleanupLog.txt"
+#Requires -RunAsAdministrator
+# データ削除スクリプト（安全化・堅牢化版）
+# 変更点:
+# - 管理者必須の宣言（#Requires）
+# - DryRun をパラメータ化（-DryRun:$true|$false）し Remove-Item の -WhatIf に連動
+# - インタラクティブユーザーの SID を解決し、SID で Win32_UserProfile/レジストリから確実にプロファイルパス取得
+# - 管理者/システム系ユーザーや Windows 配下などの保護対象を多層チェックで拒否
+# - Chrome 稼働中プロセスの停止（実削除時のみ）
+# - 既定ログ出力先を ProgramData 配下にし、作成不可時は System32 にフォールバック
 
-function Write-Log {
-    param($Message)
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "$timestamp - $Message" | Out-File -FilePath $logPath -Append -Encoding UTF8
+param(
+    [switch]$DryRun = $true,
+    [string]$LogPathOverride
+)
+
+# ログパスの決定（ProgramData 配下 -> フォールバック）
+$logPath = if ($LogPathOverride) {
+    $LogPathOverride
+} else {
+    Join-Path $env:ProgramData 'Cleanup\CleanupLog.txt'
+}
+try {
+    $logDir = Split-Path -Parent $logPath
+    if ($logDir -and -not (Test-Path $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+} catch {
+    # ProgramData に作れない場合は System32 を利用
+    $logPath = "C:\\Windows\\System32\\CleanupLog.txt"
 }
 
-Write-Log "=== クリーンアップ開始 ==="
+function Write-Log {
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    try {
+        "$timestamp - $Message" | Out-File -FilePath $logPath -Append -Encoding UTF8
+    } catch {
+        # ログ出力で例外になっても主処理は継続
+        Write-Host "$timestamp - $Message"
+    }
+}
+
+Write-Log "=== クリーンアップ開始 (DryRun=$($DryRun.IsPresent)) ==="
 
 try {
     # =========================
@@ -27,40 +59,53 @@ try {
         throw "Interactive user not found."
     }
 
-    $currentUser = $userWithDomain.Split('\')[-1]
+    $currentUser = $userWithDomain.Split('\\')[-1]
     Write-Log "検出されたインタラクティブユーザー: $currentUser"
 
+    # 危険ユーザー名の直接遮断（ドライブレター差異に依存しない）
+    $blockedUsers = @('administrator','default','defaultuser0','public','system')
+    if ($blockedUsers -contains $currentUser.ToLowerInvariant()) {
+        Write-Log "ERROR: 保護対象ユーザー名を検出しました: $currentUser。処理を中止します。"
+        throw "Refusing to operate on protected user: $currentUser"
+    }
+
     # =========================
-    # 2) プロファイルパス検索（Win32_UserProfile -> レジストリ フォールバック）
+    # 2) プロファイルパス検索（SID -> Win32_UserProfile -> レジストリ）
     # =========================
     $userProfilePath = $null
+
+    # まず SID を解決
+    $sid = $null
     try {
-        $userProfilePath = Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
-            Where-Object { $_.LocalPath -and ($_.LocalPath -match "\\$currentUser$") } |
-            Select-Object -ExpandProperty LocalPath -First 1
+        $sid = (New-Object System.Security.Principal.NTAccount($userWithDomain)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+        Write-Log "解決された SID: $sid"
     } catch {
-        Write-Log "注意: Win32_UserProfile 取得に失敗または未検出: $($_.Exception.Message)"
+        Write-Log "ERROR: SID 解決に失敗: $($_.Exception.Message)"
+        throw "Cannot resolve SID for $userWithDomain"
+    }
+
+    # SID で Win32_UserProfile を検索
+    try {
+        $profileBySid = Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$sid'" -ErrorAction Stop | Select-Object -First 1
+        if ($profileBySid -and $profileBySid.LocalPath) {
+            $userProfilePath = $profileBySid.LocalPath
+        }
+    } catch {
+        Write-Log "注意: Win32_UserProfile 取得に失敗: $($_.Exception.Message)"
         $userProfilePath = $null
     }
 
+    # レジストリにフォールバック（SID 直指定）
     if (-not $userProfilePath) {
         try {
-            $regProfiles = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList" -ErrorAction Stop
-            foreach ($key in $regProfiles) {
-                try {
-                    $p = Get-ItemProperty -Path $key.PSPath -Name "ProfileImagePath" -ErrorAction Stop
-                    if ($p.ProfileImagePath -and ($p.ProfileImagePath -match "\\$currentUser$")) {
-                        $userProfilePath = $p.ProfileImagePath
-                        break
-                    }
-                } catch {
-                    # 個別キー読み取り失敗はログに残して続行
-                    Write-Log "警告: プロファイルレジストリ読み取り失敗: $($key.PSChildName) - $($_.Exception.Message)"
-                }
+            $regKeyPath = "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\$sid"
+            $p = Get-ItemProperty -Path $regKeyPath -Name "ProfileImagePath" -ErrorAction Stop
+            if ($p.ProfileImagePath) {
+                $userProfilePath = $p.ProfileImagePath
             }
         } catch {
-            Write-Log "ERROR: レジストリからプロファイル一覧を取得できません: $($_.Exception.Message)"
-            throw "Cannot enumerate profile registry."
+            Write-Log "ERROR: レジストリからプロファイルパスを取得できません: $($_.Exception.Message)"
+            throw "Cannot read profile path from registry for SID $sid"
         }
     }
 
@@ -75,18 +120,23 @@ try {
     # 3) 安全チェック
     # =========================
     $lowerPath = $userProfilePath.ToLowerInvariant()
-    $blocked = @(
-        "c:\users\administrator",
-        "c:\users\default",
-        "c:\users\defaultuser0",
-        "c:\users\public",
-        "c:\windows"
+    $blockedPaths = @(
+        "\\windows",            # Windows 配下
+        "\\users\\administrator",# 管理者プロファイル
+        "\\users\\default",      # Default
+        "\\users\\defaultuser0", # DefaultUser0
+        "\\users\\public"        # Public
     )
-    foreach ($b in $blocked) {
-        if ($lowerPath -like "$b*") {
+    foreach ($b in $blockedPaths) {
+        if ($lowerPath -like "*${b}*") {
             Write-Log "ERROR: 保護対象のパスを検出しました: $userProfilePath。処理を中止します。"
             throw "Refusing to operate on protected profile: $userProfilePath"
         }
+    }
+    # 一般的なユーザープロファイル配下であることを確認（Users 直下）
+    if ($lowerPath -notlike "*\\users\\*") {
+        Write-Log "ERROR: ユーザープロファイルの一般的な配置ではありません: $userProfilePath"
+        throw "Unexpected profile path location: $userProfilePath"
     }
 
     # =========================
@@ -104,9 +154,6 @@ try {
     Write-Log "削除対象の一覧:"
     foreach ($p in $userDataPaths) { Write-Log "  $p" }
 
-    # DryRun フラグ（まずは $true にして確認）
-    $DryRun = $true
-
     # =========================
     # 5) 削除ループ（各 path ごとに try/catch）
     # =========================
@@ -114,12 +161,8 @@ try {
         $parent = Split-Path $path
         if (Test-Path $parent) {
             try {
-                if ($DryRun) {
-                    Write-Log "DryRun: Remove-Item -Path '$path' -Recurse -Force"
-                } else {
-                    Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
-                    Write-Log "削除成功: $path"
-                }
+                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop -WhatIf:$DryRun
+                if ($DryRun) { Write-Log "DryRun: $path を削除予定" } else { Write-Log "削除成功: $path" }
             } catch {
                 Write-Log "削除失敗: $path - $($_.Exception.Message)"
             }
@@ -134,15 +177,21 @@ try {
     $chromeLocal = Join-Path $userProfilePath "AppData\Local\Google\Chrome\User Data"
     $chromeRoaming = Join-Path $userProfilePath "AppData\Roaming\Google\Chrome"
 
+    # 実削除時は Chrome を停止
+    if (-not $DryRun) {
+        try {
+            Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Write-Log "Chrome プロセスを停止しました"
+        } catch {
+            Write-Log "Chrome 停止失敗: $($_.Exception.Message)"
+        }
+    }
+
     foreach ($path in @($chromeLocal, $chromeRoaming)) {
         if (Test-Path $path) {
             try {
-                if ($DryRun) {
-                    Write-Log "DryRun: Remove-Item -Path '$path' -Recurse -Force"
-                } else {
-                    Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
-                    Write-Log "削除成功: $path"
-                }
+                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop -WhatIf:$DryRun
+                if ($DryRun) { Write-Log "DryRun: $path を削除予定" } else { Write-Log "削除成功: $path" }
             } catch {
                 Write-Log "削除失敗: $path - $($_.Exception.Message)"
             }
@@ -157,12 +206,8 @@ try {
     $userTemp = Join-Path $userProfilePath "AppData\Local\Temp\*"
     try {
         if (Test-Path (Split-Path $userTemp)) {
-            if ($DryRun) {
-                Write-Log "DryRun: Remove-Item -Path '$userTemp' -Recurse -Force"
-            } else {
-                Remove-Item -Path $userTemp -Recurse -Force -ErrorAction SilentlyContinue
-                Write-Log "一時ファイル削除完了: $userTemp"
-            }
+            Remove-Item -Path $userTemp -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$DryRun
+            if ($DryRun) { Write-Log "DryRun: $userTemp を削除予定" } else { Write-Log "一時ファイル削除完了: $userTemp" }
         } else {
             Write-Log "ユーザー TEMP が見つかりません: $userTemp"
         }
@@ -177,76 +222,3 @@ try {
     Write-Log "エラー発生: $($_.Exception.Message)"
 }
 
-
-導入手順
-1. スクリプトの配置
-
-管理者としてPowerShellを起動
-スクリプトを非表示の場所に保存：
-
-powershell# スクリプト保存先ディレクトリを作成
-New-Item -Path "C:\Windows\System32\Scripts" -ItemType Directory -Force
-
-# スクリプトをメモ帳で作成
-notepad C:\Windows\System32\Scripts\CleanupUserData.ps1
-
-上記のスクリプトをコピー＆ペーストして保存
-
-2. 実行ポリシーの設定
-powershell# PowerShellスクリプトの実行を許可
-Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
-3. タスクスケジューラの設定
-シャットダウン時に実行する場合：
-powershell# シャットダウン時のタスク作成
-$action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File C:\Windows\System32\Scripts\CleanupUserData.ps1"
-
-$trigger = New-ScheduledTaskTrigger -AtLogOff
-
-$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
-
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-
-Register-ScheduledTask -TaskName "UserDataCleanup_Shutdown" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "シャットダウン時にユーザーデータを削除"
-起動時に実行する場合：
-powershell# 起動時のタスク作成
-$action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File C:\Windows\System32\Scripts\CleanupUserData.ps1"
-
-$trigger = New-ScheduledTaskTrigger -AtStartup
-
-$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
-
-$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-
-Register-ScheduledTask -TaskName "UserDataCleanup_Startup" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "起動時にユーザーデータを削除"
-4. 動作確認
-powershell# 手動でタスクを実行してテスト
-Start-ScheduledTask -TaskName "UserDataCleanup_Startup"
-
-# ログを確認
-Get-Content C:\Windows\System32\CleanupLog.txt
-注意事項
-⚠️ 重要な警告：
-
-データは完全に削除されます - 復元できません
-テスト環境で十分に検証してください
-バックアップが必要なデータは別の場所に保存してください
-業務環境で使用する場合は、組織のポリシーを確認してください
-
-オプション設定
-特定のフォルダを除外する場合：
-スクリプト内の削除対象を調整：
-powershell# 例：Documentsフォルダは削除しない場合
-$userDataPaths = @(
-    "$userProfile\Downloads\*",
-    # "$userProfile\Documents\*",  # コメントアウト
-    "$userProfile\Desktop\*"
-)
-複数ユーザーに対応する場合：
-全ユーザーを対象にする場合は、スクリプトの先頭に追加：
-powershell# 全ユーザーのプロファイルを取得
-$users = Get-ChildItem "C:\Users" -Directory | Where-Object { $_.Name -ne "Public" }
-
-foreach ($user in $users) {
-    $userProfile = $user.FullName
-    # 以降の処理...
-}
