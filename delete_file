@@ -144,6 +144,38 @@ try {
                     Write-Log "削除成功: $path"
                 }
             } catch {
+                Write-Log "削除失敗: $path - $($_.Exception.Message)"
+            }
+        } else {
+            Write-Log "Chrome データが見つかりませんでした: $path"
+        }
+    }
+
+    # =========================
+    # 7) ユーザー TEMP（プロファイル配下）
+    # =========================
+    $userTemp = Join-Path $userProfilePath "AppData\Local\Temp\*"
+    try {
+        if (Test-Path (Split-Path $userTemp)) {
+            if ($DryRun) {
+                Write-Log "DryRun: Remove-Item -Path '$userTemp' -Recurse -Force"
+            } else {
+                Remove-Item -Path $userTemp -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Log "一時ファイル削除完了: $userTemp"
+            }
+        } else {
+            Write-Log "ユーザー TEMP が見つかりません: $userTemp"
+        }
+    } catch {
+        Write-Log "一時ファイル削除中のエラー: $($_.Exception.Message)"
+    }
+
+    Write-Log "=== クリーンアップ完了 ==="
+
+} catch {
+    # トップレベルの例外はここに来る
+    Write-Log "エラー発生: $($_.Exception.Message)"
+}
 
 
 
