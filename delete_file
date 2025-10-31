@@ -5,73 +5,146 @@
 $logPath = "C:\Windows\System32\CleanupLog.txt"
 
 function Write-Log {
-    param($Message)
+    param([string]$Message)
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "$timestamp - $Message" | Out-File -FilePath $logPath -Append
+    "$timestamp - $Message" | Out-File -FilePath $logPath -Append -Encoding UTF8
 }
 
-Write-Log "=== クリーンアップ開始 ==="
+function Get-AdminMemberSids {
+    # ローカル Administrators グループのメンバー SID 一覧を取得
+    $adminSids = @()
+    try {
+        $adminSids = (Get-LocalGroupMember -Group 'Administrators' -ErrorAction Stop |
+            Where-Object { $_.ObjectClass -eq 'User' -or $_.ObjectClass -eq 'Group' } |
+            Select-Object -ExpandProperty SID)
+    } catch {
+        # Get-LocalGroupMember が使えない環境のため ADSI で取得
+        try {
+            $group = [ADSI]"WinNT://./Administrators,group"
+            $members = @($group.psbase.Invoke('Members'))
+            foreach ($m in $members) {
+                try {
+                    $path = $m.GetType().InvokeMember('ADsPath','GetProperty',$null,$m,$null)
+                    if ($path -match 'WinNT://([^/]+)/([^,]+)') {
+                        $domain = $Matches[1]
+                        $name = $Matches[2]
+                        $nt = New-Object System.Security.Principal.NTAccount($domain, $name)
+                        $sid = $nt.Translate([System.Security.Principal.SecurityIdentifier])
+                        $adminSids += $sid.Value
+                    }
+                } catch {}
+            }
+        } catch {}
+    }
+    return @($adminSids | Select-Object -Unique)
+}
+
+function Get-StandardUserProfiles {
+    # 一般ユーザー（ローカル管理者に属さない）のプロファイルパス一覧を返す
+    $excludeNames = @('Administrator','Default','Default User','Public','All Users')
+    $adminMemberSids = Get-AdminMemberSids
+
+    # レジストリで SID とプロファイルパスの対応を取得
+    $profileEntries = @()
+    $regBase = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+    try {
+        $profileEntries = Get-ChildItem $regBase -ErrorAction Stop | ForEach-Object {
+            $sid = $_.PSChildName
+            $props = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+            [PSCustomObject]@{
+                SID  = $sid
+                Path = $props.ProfileImagePath
+            }
+        }
+    } catch {}
+
+    # C:\Users 配下の実在ディレクトリを列挙
+    $dirs = Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $excludeNames -notcontains $_.Name }
+
+    $targets = @()
+    foreach ($d in $dirs) {
+        $path = $d.FullName
+        # レジストリエントリから一致する SID を探す
+        $sid = ($profileEntries | Where-Object { $_.Path -ieq $path }).SID | Select-Object -First 1
+        if (-not $sid) {
+            # レジストリに無い場合はスキップ（システムや一時プロファイルの可能性）
+            continue
+        }
+        # 管理者グループの SID と一致するものは除外
+        if ($adminMemberSids -contains $sid) { continue }
+
+        $targets += [PSCustomObject]@{ Name = $d.Name; Path = $path; SID = $sid }
+    }
+    return $targets
+}
+
+Write-Log "=== クリーンアップ開始（一般ユーザー対象） ==="
 
 try {
-    # 現在のユーザー名を取得
-    $currentUser = $env:USERNAME
-    $userProfile = $env:USERPROFILE
-
-    Write-Log "対象ユーザー: $currentUser"
-
-    # Chromeプロセスを強制終了
+    # Chrome プロセスを強制終了（全セッション対象）
     Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Seconds 2
 
-    # Chromeのユーザーデータを削除
-    $chromePaths = @(
-        "$env:LOCALAPPDATA\Google\Chrome\User Data",
-        "$env:APPDATA\Google\Chrome"
-    )
-
-    foreach ($path in $chromePaths) {
-        if (Test-Path $path) {
-            try {
-                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
-                Write-Log "削除成功: $path"
-            } catch {
-                Write-Log "削除失敗: $path - $($_.Exception.Message)"
-            }
-        }
+    $standardProfiles = Get-StandardUserProfiles
+    if (-not $standardProfiles -or $standardProfiles.Count -eq 0) {
+        Write-Log "対象となる一般ユーザープロファイルは見つかりませんでした。"
     }
 
-    # ユーザー領域のデータを削除
-    $userDataPaths = @(
-        "$userProfile\Downloads\*",
-        "$userProfile\Documents\*",
-        "$userProfile\Desktop\*",
-        "$userProfile\Pictures\*",
-        "$userProfile\Videos\*",
-        "$userProfile\Music\*"
-    )
+    foreach ($profile in $standardProfiles) {
+        $userProfile = $profile.Path
+        Write-Log "対象ユーザー: $($profile.Name) [$userProfile]"
 
-    foreach ($path in $userDataPaths) {
-        if (Test-Path (Split-Path $path)) {
-            try {
-                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
-                Write-Log "削除成功: $path"
-            } catch {
-                Write-Log "削除失敗: $path - $($_.Exception.Message)"
+        # Chrome のユーザーデータパス
+        $chromePaths = @(
+            Join-Path $userProfile 'AppData\Local\Google\Chrome\User Data',
+            Join-Path $userProfile 'AppData\Roaming\Google\Chrome'
+        )
+
+        foreach ($path in $chromePaths) {
+            if (Test-Path $path) {
+                try {
+                    Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
+                    Write-Log "削除成功: $path"
+                } catch {
+                    Write-Log "削除失敗: $path - $($_.Exception.Message)"
+                }
             }
         }
-    }
 
-    # 一時ファイルの削除
-    $tempPaths = @(
-        "$env:TEMP\*",
-        "$env:LOCALAPPDATA\Temp\*"
-    )
+        # ユーザー領域のデータを削除
+        $userDataPaths = @(
+            (Join-Path $userProfile 'Downloads\*'),
+            (Join-Path $userProfile 'Documents\*'),
+            (Join-Path $userProfile 'Desktop\*'),
+            (Join-Path $userProfile 'Pictures\*'),
+            (Join-Path $userProfile 'Videos\*'),
+            (Join-Path $userProfile 'Music\*')
+        )
 
-    foreach ($path in $tempPaths) {
-        try {
-            Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
-        } catch {
-            # 一時ファイルはエラーがあっても続行
+        foreach ($path in $userDataPaths) {
+            $parent = Split-Path $path -Parent
+            if (Test-Path $parent) {
+                try {
+                    Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
+                    Write-Log "削除成功: $path"
+                } catch {
+                    Write-Log "削除失敗: $path - $($_.Exception.Message)"
+                }
+            }
+        }
+
+        # 一時ファイルの削除（ユーザープロファイル配下）
+        $tempPaths = @(
+            (Join-Path $userProfile 'AppData\Local\Temp\*')
+        )
+
+        foreach ($path in $tempPaths) {
+            try {
+                Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
+            } catch {
+                # 一時ファイルはエラーがあっても続行
+            }
         }
     }
 
