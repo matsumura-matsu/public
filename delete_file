@@ -1,0 +1,156 @@
+# データ削除スクリプト
+# 管理者権限で実行される前提
+
+# ログファイルのパス
+$logPath = "C:\Windows\System32\CleanupLog.txt"
+
+function Write-Log {
+    param($Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$timestamp - $Message" | Out-File -FilePath $logPath -Append
+}
+
+Write-Log "=== クリーンアップ開始 ==="
+
+try {
+    # 現在のユーザー名を取得
+    $currentUser = $env:USERNAME
+    $userProfile = $env:USERPROFILE
+
+    Write-Log "対象ユーザー: $currentUser"
+
+    # Chromeプロセスを強制終了
+    Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Seconds 2
+
+    # Chromeのユーザーデータを削除
+    $chromePaths = @(
+        "$env:LOCALAPPDATA\Google\Chrome\User Data",
+        "$env:APPDATA\Google\Chrome"
+    )
+
+    foreach ($path in $chromePaths) {
+        if (Test-Path $path) {
+            try {
+                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
+                Write-Log "削除成功: $path"
+            } catch {
+                Write-Log "削除失敗: $path - $($_.Exception.Message)"
+            }
+        }
+    }
+
+    # ユーザー領域のデータを削除
+    $userDataPaths = @(
+        "$userProfile\Downloads\*",
+        "$userProfile\Documents\*",
+        "$userProfile\Desktop\*",
+        "$userProfile\Pictures\*",
+        "$userProfile\Videos\*",
+        "$userProfile\Music\*"
+    )
+
+    foreach ($path in $userDataPaths) {
+        if (Test-Path (Split-Path $path)) {
+            try {
+                Remove-Item -Path $path -Recurse -Force -ErrorAction Stop
+                Write-Log "削除成功: $path"
+            } catch {
+                Write-Log "削除失敗: $path - $($_.Exception.Message)"
+            }
+        }
+    }
+
+    # 一時ファイルの削除
+    $tempPaths = @(
+        "$env:TEMP\*",
+        "$env:LOCALAPPDATA\Temp\*"
+    )
+
+    foreach ($path in $tempPaths) {
+        try {
+            Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
+        } catch {
+            # 一時ファイルはエラーがあっても続行
+        }
+    }
+
+    Write-Log "=== クリーンアップ完了 ==="
+
+} catch {
+    Write-Log "エラー発生: $($_.Exception.Message)"
+}
+
+
+導入手順
+1. スクリプトの配置
+
+管理者としてPowerShellを起動
+スクリプトを非表示の場所に保存：
+
+powershell# スクリプト保存先ディレクトリを作成
+New-Item -Path "C:\Windows\System32\Scripts" -ItemType Directory -Force
+
+# スクリプトをメモ帳で作成
+notepad C:\Windows\System32\Scripts\CleanupUserData.ps1
+
+上記のスクリプトをコピー＆ペーストして保存
+
+2. 実行ポリシーの設定
+powershell# PowerShellスクリプトの実行を許可
+Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
+3. タスクスケジューラの設定
+シャットダウン時に実行する場合：
+powershell# シャットダウン時のタスク作成
+$action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File C:\Windows\System32\Scripts\CleanupUserData.ps1"
+
+$trigger = New-ScheduledTaskTrigger -AtLogOff
+
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+
+Register-ScheduledTask -TaskName "UserDataCleanup_Shutdown" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "シャットダウン時にユーザーデータを削除"
+起動時に実行する場合：
+powershell# 起動時のタスク作成
+$action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File C:\Windows\System32\Scripts\CleanupUserData.ps1"
+
+$trigger = New-ScheduledTaskTrigger -AtStartup
+
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+
+Register-ScheduledTask -TaskName "UserDataCleanup_Startup" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "起動時にユーザーデータを削除"
+4. 動作確認
+powershell# 手動でタスクを実行してテスト
+Start-ScheduledTask -TaskName "UserDataCleanup_Startup"
+
+# ログを確認
+Get-Content C:\Windows\System32\CleanupLog.txt
+注意事項
+⚠️ 重要な警告：
+
+データは完全に削除されます - 復元できません
+テスト環境で十分に検証してください
+バックアップが必要なデータは別の場所に保存してください
+業務環境で使用する場合は、組織のポリシーを確認してください
+
+オプション設定
+特定のフォルダを除外する場合：
+スクリプト内の削除対象を調整：
+powershell# 例：Documentsフォルダは削除しない場合
+$userDataPaths = @(
+    "$userProfile\Downloads\*",
+    # "$userProfile\Documents\*",  # コメントアウト
+    "$userProfile\Desktop\*"
+)
+複数ユーザーに対応する場合：
+全ユーザーを対象にする場合は、スクリプトの先頭に追加：
+powershell# 全ユーザーのプロファイルを取得
+$users = Get-ChildItem "C:\Users" -Directory | Where-Object { $_.Name -ne "Public" }
+
+foreach ($user in $users) {
+    $userProfile = $user.FullName
+    # 以降の処理...
+}
