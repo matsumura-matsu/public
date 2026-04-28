@@ -1,0 +1,17 @@
+winget install -e --id Git.Git
+winget install -e --id GitHub.cli
+winget install -e --id Microsoft.WindowsTerminal
+winget install -e --id Microsoft.PowerShell
+winget install -e --id OpenJS.NodeJS.LTS
+winget install -e --id OpenAI.Codex
+winget install -e --id Ngrok.Ngrok
+winget install -e --id Anthropic.ClaudeCode
+winget install -e --id Google.CloudSDK
+winget install -e --id Google.FirebaseCLI
+winget install -e --id EclipseAdoptium.Temurin.21.JDK
+
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+Expand-Archive agentize-dev-cli-*-windows.zip
+cd agentize-dev-cli-*-windows
+.\install.bat
