@@ -1,0 +1,67 @@
+## ① Homebrewのインストール
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+---
+
+## ② 各ツールのインストール
+
+```bash
+brew update
+
+# Git
+brew install git
+
+# GitHub CLI
+brew install gh
+
+# Terminal（iTerm2推奨）
+brew install --cask iterm2
+
+# PowerShell
+brew install --cask powershell
+
+# Node.js (LTS)
+brew install node
+
+# OpenAI Codex（CLI想定）
+npm install -g @openai/codex
+
+# ngrok
+brew install ngrok
+
+# Claude Code（Anthropic CLI）
+npm install -g @anthropic-ai/claude-code
+
+# Google Cloud SDK
+brew install --cask google-cloud-sdk
+
+# Firebase CLI
+npm install -g firebase-tools
+
+# Java (Temurin 21)
+brew install --cask temurin@21
+```
+
+---
+
+## ③ uv のインストール
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+---
+
+## ④ agentize-dev-cli のセットアップ
+
+ZIPをダウンロード済み前提：
+
+```bash
+unzip agentize-dev-cli-*-macos.zip
+cd agentize-dev-cli-*-macos
+chmod +x install.sh
+./install.sh
+```
